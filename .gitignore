@@ -1,0 +1,38 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual environments
+.venv/
+examples/libero/.venv/
+
+# Model weights / checkpoints / generated assets
+checkpoints/
+assets/
+runs/
+
+# Videos and large outputs
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Local cache
+.cache/
+.cache*/
+*.log
+
+# Editor
+.vscode/
+.idea/
+
+# Backup files
+*.bak
+*.bak_*
+
+# Manually cloned third-party LIBERO, if not intended as source snapshot
+# 如果你希望把 third_party/libero 也提交，就注释掉下一行
+third_party/libero/
