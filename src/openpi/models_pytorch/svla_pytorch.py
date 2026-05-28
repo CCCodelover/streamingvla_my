@@ -100,7 +100,7 @@ class SVLAPytorch(nn.Module):
         
         object.__setattr__(self, 'aeo_predictor', aeo)
         
-        # Load the checkpoint for the AEO predictor
+        # Load the checkpoint for the AEO predictor补上 AEO predictor 路径
         checkpoint_path = "/home/ubuntu/StreamingVLA/checkpoints/StreamingVLA_LIBERO_Predictor/svla_predictor.pth"  # e.g., "gs://openpi-assets/checkpoints/aeo_predictor/your_checkpoint.pth"
         
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -310,7 +310,7 @@ class SVLAPytorch(nn.Module):
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
-        #use_sfp
+        #修复 use_sfp 缺失;StreamingVLA 当前是单步流式动作生成，每次只生成一个 action token。若 use_sfp=False，模型会按 action_horizon=10 构造 suffix attention mask，导致维度错误。设为 True 后，suffix 长度变为 1，符合 streaming one-action-at-a-time generation。
         att_masks += [1] + ([0] * (self.config.action_horizon - 1)) if not getattr(self.config, "use_sfp", True) else [1] + ([0] * (1 - 1))
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
