@@ -91,7 +91,7 @@ def main(args: Args) -> None:
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
-
+#   勘误 if not policy.model.config.svla
     if not policy._model.config.svla:
         server = websocket_policy_server.WebsocketPolicyServer(
             policy=policy,
