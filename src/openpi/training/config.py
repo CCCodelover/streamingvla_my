@@ -21,6 +21,7 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+# import 会触发缺失的 pi0_fast 相关模块，而 LIBERO 复现不需要 RoboArena。
 # import openpi.training.misc.roboarena_config as roboarena_config  # disabled for LIBERO-only StreamingVLA inference
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -122,6 +123,7 @@ class ModelTransformFactory(GroupFactory):
                     ],
                 )
             case _model.ModelType.PI05 | _model.ModelType.SVLA:
+                #原来完全缺失对 _model.ModelType.SVLA描述，SVLA 复用 PI05 的图像、语言、state/action transform，模型输入格式
                 assert isinstance(model_config, pi0_config.Pi0Config)
                 return _transforms.Group(
                     inputs=[
@@ -453,6 +455,7 @@ _CONFIGS = [
         name="streamingvla_pi05_libero",
         model=pi0_config.Pi0Config(pi05=True, svla=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
+            #把占位数据路径改为真实 LIBERO asset；state/action 的归一化和反归一化必须和checkpoint（server 能正确加载）匹配。
             repo_id="physical-intelligence/libero",
             assets=AssetsConfig(asset_id="physical-intelligence/libero"),
             base_config=DataConfig(prompt_from_task=True),
