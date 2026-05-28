@@ -152,6 +152,8 @@ class Normalize(DataTransformFn):
         q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
         scale = np.maximum(np.abs(q99), np.abs(q01)) + 1e-6
         return x / scale
+        #论文中为scale = qmax - qmin
+        #a' = a / scale
 
 @dataclasses.dataclass(frozen=True)
 class Unnormalize(DataTransformFn):
