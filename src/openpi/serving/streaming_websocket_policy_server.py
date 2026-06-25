@@ -54,27 +54,53 @@ class WebsocketPolicyServer:
         index=0
         while True:
             try:
-                infer_time=time.monotonic()
-                obs = msgpack_numpy.unpackb(await websocket.recv()) 
-                action_stream: Iterator[dict] = self._policy.streaming_infer(obs) 
+                recv_payload = await websocket.recv()
+                uplink_payload_bytes = len(recv_payload) if isinstance(recv_payload, bytes) else len(recv_payload.encode("utf-8"))
+                unpack_start = time.monotonic()
+                obs = msgpack_numpy.unpackb(recv_payload)
+                server_unpack_ms = (time.monotonic() - unpack_start) * 1000
+                request_metadata = obs.get("__telemetry", {}) if isinstance(obs, dict) else {}
+                request_id = request_metadata.get("request_id")
+
+                action_stream: Iterator[dict] = self._policy.streaming_infer(obs)
+                policy_start = time.monotonic()
                 for action in action_stream:
-                    
                     if "actions" in action:
-                        
-                        infer_time = time.monotonic() - infer_time
+                        server_policy_to_action_ms = (time.monotonic() - policy_start) * 1000
                         action["server_timing"] = {
-                            "infer_ms": infer_time * 1000,
+                            "infer_ms": server_policy_to_action_ms,
+                        }
+                        action["transport_timing"] = {
+                            "request_id": request_id,
+                            "uplink_payload_bytes": uplink_payload_bytes,
+                            "server_unpack_ms": server_unpack_ms,
+                            "server_policy_to_action_ms": server_policy_to_action_ms,
                         }
                         action["index"] = index
                         index=index+1
 
-                        await websocket.send(packer.pack(action)) 
-                       
-                        infer_time = time.monotonic() 
+                        pack_start = time.monotonic()
+                        action["transport_timing"]["server_pack_ms"] = 0.0
+                        packed_action = packer.pack(action)
+                        server_pack_ms = (time.monotonic() - pack_start) * 1000
+                        action["transport_timing"]["server_pack_ms"] = server_pack_ms
+                        action["transport_timing"]["downlink_payload_bytes"] = len(packed_action)
+                        packed_action = packer.pack(action)
+                        await websocket.send(packed_action)
+
+                        policy_start = time.monotonic()
 
                     if "norm_exceeded" in action:
                         print("[Server] Norm exceeded, send exceed signal")
-                        await websocket.send(packer.pack(action)) 
+                        action["transport_timing"] = {
+                            "request_id": request_id,
+                            "uplink_payload_bytes": uplink_payload_bytes,
+                            "server_unpack_ms": server_unpack_ms,
+                        }
+                        packed_action = packer.pack(action)
+                        action["transport_timing"]["downlink_payload_bytes"] = len(packed_action)
+                        packed_action = packer.pack(action)
+                        await websocket.send(packed_action)
                 
             except websockets.ConnectionClosed:
                 logger.info(f"Connection from {websocket.remote_address} closed")
