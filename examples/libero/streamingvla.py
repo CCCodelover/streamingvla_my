@@ -71,6 +71,8 @@ def eval_libero(args: Args) -> None:
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
     suite_total_episodes, suite_total_successes = 0, 0
     suite_total_time_success, suite_total_actions_success = 0.0, 0
+    suite_total_norm_exceeded, suite_total_skipped_denoise = 0, 0
+    suite_total_episode_time, suite_total_episode_actions = 0.0, 0
     
     pathlib.Path(args.timing_output_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -90,7 +92,10 @@ def eval_libero(args: Args) -> None:
 
             task_episode_results: List[Tuple[bool, float, int]] = [] 
             task_successful_episodes_data: List[Tuple[float, int]] = []
-            task_sim_time_list: List[float] = [] 
+            task_sim_time_list: List[float] = []
+            task_transport_timing: dict[str, List[float]] = {}
+            task_norm_exceeded_count, task_skipped_denoise_count = 0, 0
+            task_total_episode_time, task_total_episode_actions = 0.0, 0
 
             for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
                 logging.info(f"\nTask: {task_description} | Episode: {episode_idx + 1}")
@@ -110,6 +115,9 @@ def eval_libero(args: Args) -> None:
                 jump_times = 0
                 obs_times = 0
                 episode_success = False
+                episode_norm_exceeded_count = 0
+                episode_skipped_denoise_count = 0
+                episode_transport_timing: dict[str, List[float]] = {}
                 norm_new_obs=True
                 new_task = True
                 
@@ -186,8 +194,18 @@ def eval_libero(args: Args) -> None:
                             if action_data is not None:
                                 break
                             
+                        transport_timing = action_data.get("transport_timing", {}) if isinstance(action_data, dict) else {}
+                        for timing_key, timing_value in transport_timing.items():
+                            if isinstance(timing_value, (int, float)):
+                                episode_transport_timing.setdefault(timing_key, []).append(float(timing_value))
+                                task_transport_timing.setdefault(timing_key, []).append(float(timing_value))
+
                         if "norm_exceeded" in action_data:
-                            norm_new_obs = True                         
+                            episode_norm_exceeded_count += 1
+                            episode_skipped_denoise_count += 1
+                            task_norm_exceeded_count += 1
+                            task_skipped_denoise_count += 1
+                            norm_new_obs = True
                             continue
 
                         if "actions" in action_data:
@@ -229,6 +247,8 @@ def eval_libero(args: Args) -> None:
 
                 
                 task_episode_results.append((episode_success, episode_total_time, episode_actions))
+                task_total_episode_time += episode_total_time
+                task_total_episode_actions += episode_actions
 
                 if episode_success:
                     task_successful_episodes_data.append((episode_total_time, episode_actions))
@@ -236,7 +256,16 @@ def eval_libero(args: Args) -> None:
                     timing_file.write(f"{episode_idx + 1:7d} | SUCCESS | {episode_total_time:14.2f} | {episode_actions:7d} | {action_speed:14.4f}\n")
                 
                 success_status = "SUCCESS" if episode_success else "FAILURE"
-                logging.info(f"Episode {episode_idx + 1} Result: {success_status} | Time: {episode_total_time:.2f} s | Actions: {episode_actions}")
+                episode_avg_e2e = (
+                    sum(episode_transport_timing.get("client_e2e_ms", [])) / len(episode_transport_timing.get("client_e2e_ms", []))
+                    if episode_transport_timing.get("client_e2e_ms")
+                    else 0.0
+                )
+                logging.info(
+                    f"Episode {episode_idx + 1} Result: {success_status} | Time: {episode_total_time:.2f} s | "
+                    f"Actions: {episode_actions} | Norm exceeded: {episode_norm_exceeded_count} | "
+                    f"Skipped denoise: {episode_skipped_denoise_count} | Avg E2E: {episode_avg_e2e:.2f} ms"
+                )
             
            
             num_trials = len(task_episode_results)
@@ -258,18 +287,41 @@ def eval_libero(args: Args) -> None:
                     task_avg_time_success, task_avg_actions_success, task_avg_speed = 0.0, 0.0, 0.0
 
                 task_avg_sim_time = sum(task_sim_time_list) / len(task_sim_time_list) if task_sim_time_list else 0.0
-                
+                task_avg_episode_time_all = task_total_episode_time / num_trials if num_trials > 0 else 0.0
+                task_avg_episode_actions_all = task_total_episode_actions / num_trials if num_trials > 0 else 0.0
+
+                def _avg_transport(key: str) -> float:
+                    values = task_transport_timing.get(key, [])
+                    return sum(values) / len(values) if values else 0.0
+
                 timing_file.write("-" * 80 + "\n")
                 timing_file.write(f"Task Summary: {task_description}\n")
                 timing_file.write(f"  Avg Success Rate (All Trials): {task_avg_success_rate:.4f} ({num_successes}/{num_trials})\n")
                 timing_file.write(f"  Avg Episode Time (Success Only): {task_avg_time_success:.2f} seconds\n")
+                timing_file.write(f"  Avg Episode Time (All Trials): {task_avg_episode_time_all:.2f} seconds\n")
                 timing_file.write(f"  Avg Actions/Episode (Success Only): {task_avg_actions_success:.2f} actions\n")
+                timing_file.write(f"  Avg Actions/Episode (All Trials): {task_avg_episode_actions_all:.2f} actions\n")
+                timing_file.write(f"  Norm Exceeded Count: {task_norm_exceeded_count}\n")
+                timing_file.write(f"  Skipping Denoise Count: {task_skipped_denoise_count}\n")
                 timing_file.write(f"  Avg Action Speed (Success Only): {task_avg_speed:.2f} actions/second\n")
                 timing_file.write(f"  Avg Sim Step Time: {task_avg_sim_time * 1000:.4f} ms\n")
+                timing_file.write(f"  Avg Client Pack Time: {_avg_transport('client_pack_ms'):.4f} ms\n")
+                timing_file.write(f"  Avg Client Send Time: {_avg_transport('client_send_ms'):.4f} ms\n")
+                timing_file.write(f"  Avg Server Unpack Time: {_avg_transport('server_unpack_ms'):.4f} ms\n")
+                timing_file.write(f"  Avg Server Policy Time: {_avg_transport('server_policy_to_action_ms'):.4f} ms\n")
+                timing_file.write(f"  Avg Server Pack Time: {_avg_transport('server_pack_ms'):.4f} ms\n")
+                timing_file.write(f"  Avg Client Unpack Time: {_avg_transport('client_unpack_ms'):.4f} ms\n")
+                timing_file.write(f"  Avg Client E2E Action Latency: {_avg_transport('client_e2e_ms'):.4f} ms\n")
+                timing_file.write(f"  Avg Uplink Payload: {_avg_transport('client_uplink_payload_bytes'):.2f} bytes\n")
+                timing_file.write(f"  Avg Downlink Payload: {_avg_transport('client_downlink_payload_bytes'):.2f} bytes\n")
                 timing_file.write("=" * 80 + "\n\n")
 
                 suite_total_episodes += num_trials
                 suite_total_successes += num_successes
+                suite_total_norm_exceeded += task_norm_exceeded_count
+                suite_total_skipped_denoise += task_skipped_denoise_count
+                suite_total_episode_time += task_total_episode_time
+                suite_total_episode_actions += task_total_episode_actions
 
                 logging.info(f"Task Success Rate: {task_avg_success_rate:.4f}")
 
@@ -284,6 +336,8 @@ def eval_libero(args: Args) -> None:
             suite_avg_speed_success = suite_total_actions_success / suite_total_time_success if suite_total_time_success > 0 else 0.0
         else:
             suite_avg_success_rate, suite_avg_time_success, suite_avg_actions_success, suite_avg_speed_success = 0.0, 0.0, 0.0, 0.0
+        suite_avg_episode_time_all = suite_total_episode_time / suite_total_episodes if suite_total_episodes > 0 else 0.0
+        suite_avg_actions_all = suite_total_episode_actions / suite_total_episodes if suite_total_episodes > 0 else 0.0
             
         timing_file.write("\n\n")
         timing_file.write("################################################################################\n")
@@ -294,8 +348,12 @@ def eval_libero(args: Args) -> None:
         timing_file.write(f"Total Successful Episodes: {suite_total_successes}\n")
         timing_file.write(f"Overall Success Rate (All Trials): {suite_avg_success_rate:.4f} ({suite_total_successes}/{suite_total_episodes})\n")
         timing_file.write(f"Overall Avg Episode Time (Success Only): {suite_avg_time_success:.2f} seconds\n")
+        timing_file.write(f"Overall Avg Episode Time (All Trials): {suite_avg_episode_time_all:.2f} seconds\n")
         timing_file.write(f"Overall Avg Actions/Episode (Success Only): {suite_avg_actions_success:.2f} actions\n")
+        timing_file.write(f"Overall Avg Actions/Episode (All Trials): {suite_avg_actions_all:.2f} actions\n")
         timing_file.write(f"Overall Avg Action Speed (Success Only): {suite_avg_speed_success:.2f} actions/second\n")
+        timing_file.write(f"Overall Norm Exceeded Count: {suite_total_norm_exceeded}\n")
+        timing_file.write(f"Overall Skipping Denoise Count: {suite_total_skipped_denoise}\n")
 
         logging.info(f"Total success rate: {suite_avg_success_rate:.4f}")
         logging.info(f"Total episodes: {suite_total_episodes}")    
