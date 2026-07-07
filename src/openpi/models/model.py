@@ -97,6 +97,8 @@ class Observation(Generic[ArrayT]):
     action_states:at.Float[ArrayT, "*b ad"] | None = None
     action_left_sum: at.Float[ArrayT, "*b ad"] | None = None
     threshold: at.Float[ArrayT, "*b"] | None = None
+    vision_keep_ratio: at.Float[ArrayT, "*b"] | None = None
+    runtime_token_keep_ratio: at.Float[ArrayT, "*b"] | None = None
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
     # Tokenized prompt mask.
@@ -128,6 +130,8 @@ class Observation(Generic[ArrayT]):
             action_states=data["action_states"],
             action_left_sum=data["action_left_sum"],
             threshold=data["threshold"],
+            vision_keep_ratio=data.get("vision_keep_ratio"),
+            runtime_token_keep_ratio=data.get("runtime_token_keep_ratio"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -207,6 +211,8 @@ def preprocess_observation(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
+        vision_keep_ratio=observation.vision_keep_ratio,
+        runtime_token_keep_ratio=observation.runtime_token_keep_ratio,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
