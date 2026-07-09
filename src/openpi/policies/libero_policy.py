@@ -87,6 +87,18 @@ class LiberoInputs(transforms.DataTransformFn):
             inputs["threshold"] = data["observation/threshold"]
         else:
             inputs["threshold"] = None
+        if "vision_keep_ratio" in data:
+            inputs["vision_keep_ratio"] = data["vision_keep_ratio"]
+        elif "runtime_token_keep_ratio" in data:
+            inputs["vision_keep_ratio"] = data["runtime_token_keep_ratio"]
+        else:
+            inputs["vision_keep_ratio"] = None
+        if "runtime_token_keep_ratio" in data:
+            inputs["runtime_token_keep_ratio"] = data["runtime_token_keep_ratio"]
+        elif "vision_keep_ratio" in data:
+            inputs["runtime_token_keep_ratio"] = data["vision_keep_ratio"]
+        else:
+            inputs["runtime_token_keep_ratio"] = None
         # Pass the prompt (aka language instruction) to the model.
         # Keep this for your own dataset (but modify the key if the instruction is not
         # stored in "prompt"; the output dict always needs to have the key "prompt").
