@@ -144,7 +144,16 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 recv_time = time.monotonic()
 
                 if isinstance(response, str):
-                    raise RuntimeError(f"Error in inference server:\n{response}")
+                    logging.error("[Receiver Thread] Server returned an error frame:\n%s", response)
+                    self._action_queue.put({"server_error": response})
+                    with self._lock:
+                        if self._ws:
+                            try:
+                                self._ws.close()
+                            except Exception:
+                                pass
+                        self._ws = None
+                    continue
                 downlink_payload_bytes = len(response)
                 unpack_start = time.monotonic()
                 unpacked_response = msgpack_numpy.unpackb(response)
@@ -165,8 +174,9 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 self._action_queue.put(unpacked_response)
                 logging.debug(f"[Receiver Thread] Action received. Size: {self._action_queue.qsize()}")
 
-            except websockets.exceptions.ConnectionClosed:
-                logging.warning("[Receiver Thread] Connection closed. Attempting to re-establish.")
+            except websockets.exceptions.ConnectionClosed as e:
+                logging.warning("[Receiver Thread] Connection closed. Attempting to re-establish: %s", e)
+                self._action_queue.put({"server_error": "websocket connection closed: {}".format(e)})
                 with self._lock:
                      if self._ws:
                           try:
@@ -178,6 +188,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             except Exception as e:
                 if self._stream_active: 
                     logging.error(f"[Receiver Thread] Error during stream reception: {e}", exc_info=True)
+                    self._action_queue.put({"server_error": str(e)})
 
                 with self._lock:
                      self._ws = None 
