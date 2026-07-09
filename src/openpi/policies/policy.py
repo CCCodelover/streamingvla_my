@@ -139,11 +139,17 @@ class Policy(BasePolicy):
                 # If the model indicates that the action norm was exceeded, we can choose to yield a special token to signal this condition to the client.
                 yield action_token
             else:
+                model_timing = {}
+                if isinstance(action_token, dict) and "actions" in action_token:
+                    model_timing = action_token.get("model_timing", {})
+                    action_tensor = action_token["actions"]
+                else:
+                    action_tensor = action_token
                 # Normal situation
                 outputs = {
                     "state": inputs["state"],
-                    "actions": action_token,
-                    "action_states": torch.zeros_like(action_token),
+                    "actions": action_tensor,
+                    "action_states": torch.zeros_like(action_tensor),
                 }
                 if self._is_pytorch_model:
                     outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
@@ -151,6 +157,8 @@ class Policy(BasePolicy):
                     outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
                 outputs = self._output_transform(outputs)
+                if model_timing:
+                    outputs["model_timing"] = model_timing
                 yield outputs
     
     @property
