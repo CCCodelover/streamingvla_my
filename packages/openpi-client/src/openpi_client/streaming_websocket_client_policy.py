@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import time
 import threading
@@ -10,14 +12,6 @@ import websockets.exceptions
 import numpy as np
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
-
-import sys
-import io
-import torch
-import torchvision.transforms as T
-from PIL import Image
-import os
-
 
 class WebsocketClientPolicy(_base_policy.BasePolicy):
     
@@ -150,7 +144,16 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 recv_time = time.monotonic()
 
                 if isinstance(response, str):
-                    raise RuntimeError(f"Error in inference server:\n{response}")
+                    logging.error("[Receiver Thread] Server returned an error frame:\n%s", response)
+                    self._action_queue.put({"server_error": response})
+                    with self._lock:
+                        if self._ws:
+                            try:
+                                self._ws.close()
+                            except Exception:
+                                pass
+                        self._ws = None
+                    continue
                 downlink_payload_bytes = len(response)
                 unpack_start = time.monotonic()
                 unpacked_response = msgpack_numpy.unpackb(response)
@@ -160,7 +163,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                     transport_timing = unpacked_response.setdefault("transport_timing", {})
                     transport_timing["client_downlink_payload_bytes"] = downlink_payload_bytes
                     transport_timing["client_unpack_ms"] = client_unpack_ms
-                    request_id = transport_timing.get("request_id")
+                    request_id = unpacked_response.get("request_id", transport_timing.get("request_id"))
                     if request_id in self._request_send_times:
                         transport_timing["client_e2e_ms"] = (recv_time - self._request_send_times[request_id]) * 1000
                     if request_id in self._request_send_stats:
@@ -171,8 +174,9 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 self._action_queue.put(unpacked_response)
                 logging.debug(f"[Receiver Thread] Action received. Size: {self._action_queue.qsize()}")
 
-            except websockets.exceptions.ConnectionClosed:
-                logging.warning("[Receiver Thread] Connection closed. Attempting to re-establish.")
+            except websockets.exceptions.ConnectionClosed as e:
+                logging.warning("[Receiver Thread] Connection closed. Attempting to re-establish: %s", e)
+                self._action_queue.put({"server_error": "websocket connection closed: {}".format(e)})
                 with self._lock:
                      if self._ws:
                           try:
@@ -184,6 +188,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             except Exception as e:
                 if self._stream_active: 
                     logging.error(f"[Receiver Thread] Error during stream reception: {e}", exc_info=True)
+                    self._action_queue.put({"server_error": str(e)})
 
                 with self._lock:
                      self._ws = None 
@@ -206,10 +211,13 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 return 
 
             try:
-                
-                request_id = self._request_counter
-                self._request_counter += 1
                 obs_with_metadata = copy.copy(obs)
+                request_id = obs_with_metadata.get("__request_id__")
+                if request_id is None:
+                    request_id = obs_with_metadata.get("request_id")
+                if request_id is None:
+                    request_id = self._request_counter
+                    self._request_counter += 1
                 telemetry = dict(obs_with_metadata.get("__telemetry", {}))
                 telemetry["request_id"] = request_id
                 obs_with_metadata["__telemetry"] = telemetry
@@ -234,36 +242,89 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                     client_send_ms,
                 )
 
-            except websockets.exceptions.ConnectionClosed:
-                
-                logging.warning("Connection closed during send. _Receiver_loop will handle re-establishment.")
+            except websockets.exceptions.ConnectionClosed as e:
+                logging.warning("Connection closed during send. _Receiver_loop will handle re-establishment: %s", e)
+                self._action_queue.put({"server_error": "websocket connection closed during send: {}".format(e)})
                 self._ws = None
             except Exception as e:
                 logging.error(f"Unexpected error during send: {e}")
+                self._action_queue.put({"server_error": "send failed: {}".format(e)})
                 self._ws = None
                 return
                 
-    def get_queue_length(self) -> int:
-        return self._action_queue.qsize()
+    def clear_action_queue(self) -> int:
+        """Drop all queued actions without draining via get_next_action."""
+        q = self._action_queue
+        with q.mutex:
+            dropped = len(q.queue)
+            q.queue.clear()
+            if hasattr(q, "unfinished_tasks"):
+                q.unfinished_tasks = max(0, q.unfinished_tasks - dropped)
+            if hasattr(q, "all_tasks_done"):
+                q.all_tasks_done.notify_all()
+        self._dropped_stale_actions = getattr(self, "_dropped_stale_actions", 0) + dropped
+        return dropped
 
-    def get_next_action(self, timeout: Optional[float] = 5) -> Union[Dict, None]:
-        with self._lock:
-            
-            try:
-                if not self._action_queue.empty():
-                    item = self._action_queue.get(timeout=timeout)      
-                    if item is not None and 'actions' in item:
-                        actions = item['actions']
-                
-                        if actions.ndim == 2 and actions.shape[0] == 1:
-                            item['actions'] = actions.flatten() 
-                        elif actions.ndim != 1:
-                            logging.warning(f"Action array has unexpected shape: {actions.shape}. Environment may fail.")
-        
-                    self._action_queue.task_done()
-                    return item
-                else:
-                    return None
-            except Exception as e:
-                logging.error(f"Error getting action from queue: {e}", exc_info=True)
+    def get_queue_length(self) -> int:
+        with self._action_queue.mutex:
+            return len(self._action_queue.queue)
+
+    @staticmethod
+    def _coerce_libero_action(item: Dict) -> Optional[Dict]:
+        if "actions" not in item:
+            return item
+        try:
+            action_np = np.asarray(item["actions"], dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError):
+            logging.warning("Dropping action with non-numeric payload.")
+            return None
+        if action_np.size < 7:
+            logging.warning("Dropping action with fewer than 7 dimensions: shape=%s", action_np.shape)
+            return None
+        action_np = action_np[:7]
+        if not np.all(np.isfinite(action_np)):
+            logging.warning("Dropping action containing NaN/Inf values.")
+            return None
+        result = dict(item)
+        result["actions"] = action_np
+        return result
+
+    def get_next_action(self, timeout: Optional[float] = 5.0, request_id: Optional[str] = None) -> Union[Dict, None]:
+        deadline = None if timeout is None else time.monotonic() + max(timeout, 0.0)
+        while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
                 return None
+            try:
+                item = self._action_queue.get(timeout=remaining)
+            except queue.Empty:
+                return None
+            except Exception as e:
+                logging.error("Error getting action from queue: %s", e, exc_info=True)
+                return None
+
+            try:
+                if not isinstance(item, dict):
+                    return item
+
+                item_request_id = item.get("request_id")
+                if item_request_id is None:
+                    item_request_id = item.get("transport_timing", {}).get("request_id")
+                if request_id is not None and item_request_id is not None and item_request_id != request_id:
+                    self._dropped_stale_actions = getattr(self, "_dropped_stale_actions", 0) + 1
+                    logging.info("Dropped stale action request_id=%s while waiting for %s", item_request_id, request_id)
+                    continue
+
+                if "norm_exceeded" in item or "server_error" in item:
+                    return item
+
+                coerced = self._coerce_libero_action(item)
+                if coerced is None:
+                    self._dropped_stale_actions = getattr(self, "_dropped_stale_actions", 0) + 1
+                    continue
+                return coerced
+            finally:
+                try:
+                    self._action_queue.task_done()
+                except ValueError:
+                    pass

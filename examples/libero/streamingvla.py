@@ -180,7 +180,7 @@ def eval_libero(args: Args) -> None:
                                     )
                                 ),
                                 "prompt": str(task_description),
-                                "observation/action_left_sum": None,
+                                "observation/action_left_sum": np.zeros(6, dtype=np.float32),
                                 "observation/action_states": action_states,
                                 "observation/threshold": 100000.0, # default: normal inference without judger feedback
                             }
