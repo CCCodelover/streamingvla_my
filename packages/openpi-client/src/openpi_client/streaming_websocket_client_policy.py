@@ -314,7 +314,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                     logging.info("Dropped stale action request_id=%s while waiting for %s", item_request_id, request_id)
                     continue
 
-                if "norm_exceeded" in item or "server_error" in item:
+                if "norm_exceeded" in item:
                     return item
 
                 coerced = self._coerce_libero_action(item)

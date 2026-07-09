@@ -328,11 +328,6 @@ def eval_libero(args: Args) -> None:
                             break
                         continue
 
-                    if "server_error" in action_data:
-                        logging.error("Server error while waiting for request_id=%s: %s", current_request_id, action_data.get("server_error"))
-                        stale_action_count += 1
-                        break
-
                     if "norm_exceeded" in action_data:
                         stale_action_count += 1
                         task_norm_exceeded += 1
