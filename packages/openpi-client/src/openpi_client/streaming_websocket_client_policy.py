@@ -242,12 +242,13 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                     client_send_ms,
                 )
 
-            except websockets.exceptions.ConnectionClosed:
-                
-                logging.warning("Connection closed during send. _Receiver_loop will handle re-establishment.")
+            except websockets.exceptions.ConnectionClosed as e:
+                logging.warning("Connection closed during send. _Receiver_loop will handle re-establishment: %s", e)
+                self._action_queue.put({"server_error": "websocket connection closed during send: {}".format(e)})
                 self._ws = None
             except Exception as e:
                 logging.error(f"Unexpected error during send: {e}")
+                self._action_queue.put({"server_error": "send failed: {}".format(e)})
                 self._ws = None
                 return
                 
