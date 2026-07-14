@@ -40,6 +40,8 @@ class Args:
     max_timeouts_per_episode: int = 1
     strict_request_id_matching: bool = False
     enable_runtime_protocol: bool = False
+    clear_action_queue_on_replan: bool = True
+    max_timeouts_per_episode: int = 1
 
     method: str = "joint_runtime"
     run_id: str = "run_001"
@@ -278,22 +280,14 @@ def eval_libero(args: Args) -> None:
                             "observation/state": np.concatenate((obs["robot0_eef_pos"], _quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])),
                             "prompt": str(task_description),
                             "observation/action_left_sum": np.zeros(6, dtype=np.float32),
-                            "observation/action_states": action_states.astype(np.float32),
+                            "observation/action_states": chunk_action_states.astype(np.float32),
                             "observation/threshold": np.asarray(100000.0, dtype=np.float32),
+                            "__request_id__": current_request_id,
+                            "execution_horizon": selected_horizon,
+                            "vision_keep_ratio": np.asarray(token_keep_ratio, dtype=np.float32),
+                            "runtime_token_keep_ratio": np.asarray(token_keep_ratio, dtype=np.float32),
+                            "runtime_policy": provisional.to_dict(),
                         }
-                        use_runtime_protocol = (
-                            args.enable_runtime_protocol
-                            or args.runtime_policy in {"adaptive", "joint"}
-                            or args.token_policy in {"fixed", "action_aware", "joint"}
-                        )
-                        if use_runtime_protocol:
-                            element.update({
-                                "__request_id__": current_request_id,
-                                "execution_horizon": selected_horizon,
-                                "vision_keep_ratio": np.asarray(token_keep_ratio, dtype=np.float32),
-                                "runtime_token_keep_ratio": np.asarray(token_keep_ratio, dtype=np.float32),
-                                "runtime_policy": provisional.to_dict(),
-                            })
                         infer_start = time.monotonic()
                         client.infer(element, new_task)
                         client_infer_ms = (time.monotonic() - infer_start) * 1000
@@ -313,23 +307,30 @@ def eval_libero(args: Args) -> None:
                         client_infer_ms = 0.0
 
                     wait_start = time.monotonic()
-                    expected_request_id = current_request_id if (should_replan and args.strict_request_id_matching and use_runtime_protocol) else None
-                    while True:
-                        action_data = client.get_next_action(timeout=args.action_timeout, request_id=expected_request_id)
-                        if action_data is not None:
-                            break
-                        timeout_count += 1
-                        logging.warning(
-                            "No action received yet for request_id=%s; keep waiting without re-sending inference.",
-                            current_request_id,
-                        )
+                    action_data = client.get_next_action(timeout=args.action_timeout, request_id=current_request_id if should_replan else None)
                     client_wait_ms = (time.monotonic() - wait_start) * 1000
                     total_action_latency_ms = image_preprocess_ms + client_infer_ms + client_wait_ms
 
-                    if "server_error" in action_data:
-                        logging.error("Server error while waiting for request_id=%s: %s", current_request_id, action_data.get("server_error"))
-                        stale_action_count += 1
-                        break
+                    if action_data is None:
+                        timeout_count += 1
+                        stale_action_count += client.clear_action_queue()
+                        profiling_rows.append({
+                            "episode_id": episode_id, "task_id": task_id, "task_name": task_description, "seed": args.seed,
+                            "run_id": args.run_id, "step": t, "method": args.method, "runtime_policy": args.runtime_policy,
+                            "token_policy": args.token_policy, "selected_horizon": selected_horizon, "horizon_reason": provisional.horizon_reason,
+                            "token_keep_ratio": token_keep_ratio, "token_reason": provisional.token_reason,
+                            "consistency_error": provisional.consistency_error, "action_variation": provisional.action_variation,
+                            "gripper_change": provisional.gripper_change, "request_id": current_request_id,
+                            "image_preprocess_time_ms": image_preprocess_ms, "client_infer_call_time_ms": client_infer_ms,
+                            "client_action_wait_time_ms": client_wait_ms, "total_action_latency_ms": total_action_latency_ms,
+                            "inference_count": inference_count, "action_count": action_count, "stale_action_count": stale_action_count,
+                            "success": False,
+                        })
+                        logging.warning("No action received for request_id=%s timeout_count=%d", current_request_id, timeout_count)
+                        steps_since_replan = 0
+                        if timeout_count > args.max_timeouts_per_episode:
+                            break
+                        continue
 
                     if "norm_exceeded" in action_data:
                         stale_action_count += 1
