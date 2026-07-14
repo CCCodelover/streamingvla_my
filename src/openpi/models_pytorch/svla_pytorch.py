@@ -1,6 +1,6 @@
 import logging
 import math
-import os
+import time
 
 import torch
 from torch import Tensor
@@ -185,6 +185,17 @@ def estimate_visual_token_payload_mb(num_tokens: int, hidden_dim: int, *, bytes_
     return num_tokens * hidden_dim * bytes_per_value / (1024 * 1024)
 
 
+def fixed_token_pooling(tokens, keep_ratio: float):
+    if keep_ratio >= 0.999:
+        return tokens
+    batch_size, num_tokens, _ = tokens.shape
+    keep_count = max(1, int(round(num_tokens * keep_ratio)))
+    if keep_count >= num_tokens:
+        return tokens
+    indices = torch.linspace(0, num_tokens - 1, keep_count, device=tokens.device).long()
+    return tokens[:, indices, :]
+
+
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "cpu":
@@ -277,6 +288,9 @@ class SVLAPytorch(nn.Module):
         self.vision_token_sensitivity_norm_weight = float(getattr(config, "vision_token_sensitivity_norm_weight", 0.25))
         self.vision_token_sensitivity_delta_weight = float(getattr(config, "vision_token_sensitivity_delta_weight", 0.65))
         self.vision_token_sensitivity_action_weight = float(getattr(config, "vision_token_sensitivity_action_weight", 0.10))
+        self.enable_actual_token_pruning = bool(getattr(config, "enable_actual_token_pruning", False))
+        self._runtime_keep_ratio = 1.0
+        self._last_model_timing = {}
 
         # Initialize the AEO predictor and load weights
         aeo = DiTPredictor(
@@ -400,7 +414,7 @@ class SVLAPytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, action_left_sum = None, train = False
+        self, images, img_masks, lang_tokens, lang_masks, action_left_sum = None, train = False, runtime_keep_ratio = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
@@ -410,6 +424,16 @@ class SVLAPytorch(nn.Module):
         att_masks = []
         delta_embedding_norm = 100000.0 # big enough
         count = 0
+        runtime_keep_ratio_value = 1.0
+        if runtime_keep_ratio is not None:
+            try:
+                runtime_keep_ratio_value = float(torch.as_tensor(runtime_keep_ratio).flatten()[0].item())
+            except (TypeError, ValueError, IndexError):
+                runtime_keep_ratio_value = 1.0
+        runtime_keep_ratio_value = max(0.01, min(1.0, runtime_keep_ratio_value))
+        token_count_before_total = 0
+        token_count_after_total = 0
+        token_hidden_dim = 0
         
         for img, img_mask in zip(images, img_masks, strict=True):
             
@@ -445,6 +469,9 @@ class SVLAPytorch(nn.Module):
                     print("No action_left_sum provided, skipping AEO predictor adjustment.")        
             
             img_pad_mask = img_mask[:, None].expand(bsize, num_img_embs)
+            token_count_before_total += int(num_img_embs)
+            token_hidden_dim = int(img_emb.shape[-1])
+            runtime_estimated_num_img_embs = int(num_img_embs)
             if self.dynamic_token_compression and not train:
                 original_num_img_embs = num_img_embs
                 threshold_value = getattr(self, "_current_aeo_threshold", None)
@@ -484,6 +511,7 @@ class SVLAPytorch(nn.Module):
                     img_emb, img_pad_mask = compress_tokens_by_1d_pooling(img_emb, img_pad_mask, keep_ratio)
                     compression_operator = "avg_pool_1d"
                 num_img_embs = img_emb.shape[1]
+                runtime_estimated_num_img_embs = int(num_img_embs)
                 compressed_payload_mb = estimate_visual_token_payload_mb(num_img_embs, img_emb.shape[-1])
                 risk_text = "none" if aeo_risk is None else f"{aeo_risk:.4f}"
                 print(
@@ -493,10 +521,28 @@ class SVLAPytorch(nn.Module):
                     f"tokens {original_num_img_embs} -> {num_img_embs} "
                     f"payload {original_payload_mb:.4f} MB -> {compressed_payload_mb:.4f} MB"
                 )
+            elif (not train) and runtime_keep_ratio_value < 0.999:
+                original_num_img_embs = num_img_embs
+                runtime_estimated_num_img_embs = max(1, int(round(original_num_img_embs * runtime_keep_ratio_value)))
+                if self.enable_actual_token_pruning:
+                    img_emb = fixed_token_pooling(img_emb, runtime_keep_ratio_value)
+                    keep_count = img_emb.shape[1]
+                    img_pad_mask = img_pad_mask[:, :keep_count]
+                    num_img_embs = keep_count
+                    runtime_estimated_num_img_embs = int(keep_count)
+                else:
+                    num_img_embs = original_num_img_embs
+                print(
+                    "[RuntimeTokenTelemetry] "
+                    f"keep_ratio={runtime_keep_ratio_value:.4f} "
+                    f"tokens {original_num_img_embs} -> {num_img_embs} "
+                    f"actual_pruning={self.enable_actual_token_pruning}"
+                )
 
             embs.append(img_emb)
             pad_masks.append(img_pad_mask)
             att_masks += [0] * num_img_embs
+            token_count_after_total += int(runtime_estimated_num_img_embs)
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
@@ -521,6 +567,13 @@ class SVLAPytorch(nn.Module):
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
+        payload_bytes = int(token_count_after_total * token_hidden_dim * 2)
+        self._last_model_timing = {
+            "runtime_token_keep_ratio": runtime_keep_ratio_value,
+            "runtime_token_count_before": token_count_before_total,
+            "runtime_token_count_after": token_count_after_total,
+            "runtime_token_payload_bytes": payload_bytes,
+        }
         return embs, pad_masks, att_masks, delta_embedding_norm
 
     def embed_suffix(self, state, noisy_actions, timestep):
@@ -671,12 +724,21 @@ class SVLAPytorch(nn.Module):
         action_states = observation.action_states
         action_left_sum = observation.action_left_sum
         threshold = observation.threshold
+        runtime_keep_ratio = observation.runtime_token_keep_ratio
+        if runtime_keep_ratio is None:
+            runtime_keep_ratio = observation.vision_keep_ratio
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
         self._current_aeo_threshold = threshold
-        prefix_embs, prefix_pad_masks, prefix_att_masks, delta_embedding_norm = self.embed_prefix(images, img_masks, lang_tokens, lang_masks, action_left_sum)
+        prefix_start = time.monotonic()
+        prefix_embs, prefix_pad_masks, prefix_att_masks, delta_embedding_norm = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, action_left_sum, runtime_keep_ratio=runtime_keep_ratio
+        )
+        prefix_ms = (time.monotonic() - prefix_start) * 1000
         self._current_aeo_threshold = None
+        self._last_model_timing["image_encode_time_ms"] = prefix_ms
+        self._last_model_timing.setdefault("tokenization_time_ms", 0.0)
 
         if (threshold==100000.0):
             print("[Sample actions]: Norm observation")
@@ -686,6 +748,7 @@ class SVLAPytorch(nn.Module):
             print(f"[Sample actions] Delta norm ({delta_embedding_norm:.4f}) > threshold ({threshold}). Skipping denoise.")
             yield {
                 "norm_exceeded": True,   
+                "model_timing": dict(self._last_model_timing),
             }
             return
 
@@ -698,6 +761,7 @@ class SVLAPytorch(nn.Module):
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager" 
 
+        forward_start = time.monotonic()
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -705,6 +769,7 @@ class SVLAPytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+        self._last_model_timing["vla_forward_time_ms"] = (time.monotonic() - forward_start) * 1000
     
         dt = 1.0 / self.config.action_horizon
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -719,6 +784,7 @@ class SVLAPytorch(nn.Module):
         while action_index < self.config.action_horizon: 
             temp_x_t = x_t.detach().clone()
 
+            chunk_start = time.monotonic()
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
@@ -726,12 +792,13 @@ class SVLAPytorch(nn.Module):
                 x_t,
                 expanded_time,
             )
+            self._last_model_timing["action_chunk_generation_time_ms"] = (time.monotonic() - chunk_start) * 1000
             expanded_time += dt
             x_t = x_t + dt * v_t
         
             action_index += 1
             result = x_t - temp_x_t
-            yield result
+            yield {"actions": result, "model_timing": dict(self._last_model_timing)}
 
         
 

@@ -587,9 +587,9 @@ python scripts/summarize_token_compression_results.py \
 
 如果失败集中在高 `risk`、高 `norm_exceeded_count` 或 episode 后半段，下一步应该增加 phase-aware replanning / 长程状态识别模块。
 
-## 10. 办公讨论时建议准备的结果表
+## 9. 办公讨论时建议准备的结果表
 
-### 10.1 成功率与稳定性表
+### 9.1 成功率与稳定性表
 
 | Method | Suite | Success | Episodes | Norm exceeded | Skipped denoise | Avg episode time |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -599,7 +599,7 @@ python scripts/summarize_token_compression_results.py \
 | aeo_three_stage | libero_object | | | | | |
 | action_sensitive | libero_object | | | | | |
 
-### 10.2 时延与 payload 表
+### 9.2 时延与 payload 表
 
 | Method | E2E ms | Server policy ms | Uplink bytes | Downlink bytes | Client pack ms | Client send ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -609,7 +609,7 @@ python scripts/summarize_token_compression_results.py \
 | aeo_three_stage | | | | | | |
 | action_sensitive | | | | | | |
 
-### 10.3 长程任务诊断表
+### 9.3 长程任务诊断表
 
 | Method | Suite | Success | Failure phase | Avg risk | Norm exceeded | Main observation |
 | --- | --- | ---: | --- | ---: | ---: | --- |
@@ -617,7 +617,7 @@ python scripts/summarize_token_compression_results.py \
 | aeo_three_stage | libero_10 | | | | | |
 | action_sensitive | libero_10 | | | | | |
 
-## 11. 当前阶段的预期判断
+## 10. 当前阶段的预期判断
 
 1. 如果 `action_sensitive` 的成功率接近 baseline，同时降低 `server_policy_to_action_ms` 和平均 visual tokens，它就是最有价值的模型侧方法。
 2. 如果 `fixed050` 明显降时延但成功率下降，它仍然是中等压缩下界 baseline。

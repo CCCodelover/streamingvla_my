@@ -47,7 +47,6 @@ class Pi0Config(_model.BaseModelConfig):
     vision_token_sensitivity_norm_weight: float = 0.25
     vision_token_sensitivity_delta_weight: float = 0.65
     vision_token_sensitivity_action_weight: float = 0.10
-    aeo_predictor_path: str | None = None
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
