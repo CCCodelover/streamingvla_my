@@ -33,6 +33,9 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         self._receiver_thread: Optional[threading.Thread] = None
         self._stream_active: bool = True 
         self._lock = threading.Lock()
+        self._request_counter = 0
+        self._request_send_times: Dict[int, float] = {}
+        self._request_send_stats: Dict[int, Dict[str, float]] = {}
         self._ws: Optional[websockets.sync.client.ClientConnection] = None
         _, self._server_metadata = self._wait_for_metadata_only()
         self._receiver_thread = threading.Thread(target=self._stream_receiver_loop, daemon=True)
@@ -143,11 +146,25 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 continue
 
             try:
-                response = self._ws.recv() 
-                
+                response = self._ws.recv()
+                recv_time = time.monotonic()
+
                 if isinstance(response, str):
                     raise RuntimeError(f"Error in inference server:\n{response}")
+                downlink_payload_bytes = len(response)
+                unpack_start = time.monotonic()
                 unpacked_response = msgpack_numpy.unpackb(response)
+                client_unpack_ms = (time.monotonic() - unpack_start) * 1000
+
+                if isinstance(unpacked_response, dict):
+                    transport_timing = unpacked_response.setdefault("transport_timing", {})
+                    transport_timing["client_downlink_payload_bytes"] = downlink_payload_bytes
+                    transport_timing["client_unpack_ms"] = client_unpack_ms
+                    request_id = transport_timing.get("request_id")
+                    if request_id in self._request_send_times:
+                        transport_timing["client_e2e_ms"] = (recv_time - self._request_send_times[request_id]) * 1000
+                    if request_id in self._request_send_stats:
+                        transport_timing.update(self._request_send_stats[request_id])
 
                 if self._action_queue.full():
                     logging.info(f"Queue Is Full !")
@@ -190,8 +207,32 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
 
             try:
                 
-                data = self._packer.pack(obs)
-                self._ws.send(data) 
+                request_id = self._request_counter
+                self._request_counter += 1
+                obs_with_metadata = copy.copy(obs)
+                telemetry = dict(obs_with_metadata.get("__telemetry", {}))
+                telemetry["request_id"] = request_id
+                obs_with_metadata["__telemetry"] = telemetry
+
+                pack_start = time.monotonic()
+                data = self._packer.pack(obs_with_metadata)
+                client_pack_ms = (time.monotonic() - pack_start) * 1000
+                send_start = time.monotonic()
+                self._ws.send(data)
+                client_send_ms = (time.monotonic() - send_start) * 1000
+                self._request_send_times[request_id] = send_start
+                self._request_send_stats[request_id] = {
+                    "client_pack_ms": client_pack_ms,
+                    "client_send_ms": client_send_ms,
+                    "client_uplink_payload_bytes": len(data),
+                }
+                logging.info(
+                    "[ClientTransport] request_id=%s uplink_payload=%s bytes pack=%.3f ms send=%.3f ms",
+                    request_id,
+                    len(data),
+                    client_pack_ms,
+                    client_send_ms,
+                )
 
             except websockets.exceptions.ConnectionClosed:
                 

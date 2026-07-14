@@ -30,6 +30,24 @@ class Pi0Config(_model.BaseModelConfig):
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
     pi05: bool = False
     svla: bool = False
+    # StreamingVLA inference-only dynamic visual-token compression.
+    dynamic_token_compression: bool = False
+    dynamic_token_min_keep_ratio: float = 0.5
+    dynamic_token_max_keep_ratio: float = 1.0
+    dynamic_token_norm_scale: float = 4.0
+    dynamic_token_strategy: str = "action_norm"
+    vision_compression_strategy: str | None = None
+    dynamic_token_fixed_keep_ratio: float | None = None
+    dynamic_token_saliency: str = "l2"
+    dynamic_token_aeo_low_risk_threshold: float = 0.7
+    dynamic_token_aeo_high_risk_threshold: float = 0.9
+    dynamic_token_aeo_low_keep_ratio: float = 0.5
+    dynamic_token_aeo_mid_keep_ratio: float = 0.75
+    dynamic_token_aeo_high_keep_ratio: float = 1.0
+    vision_token_sensitivity_norm_weight: float = 0.25
+    vision_token_sensitivity_delta_weight: float = 0.65
+    vision_token_sensitivity_action_weight: float = 0.10
+    aeo_predictor_path: str | None = None
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 

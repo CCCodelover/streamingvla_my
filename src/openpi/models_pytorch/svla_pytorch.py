@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 
 import torch
 from torch import Tensor
@@ -9,9 +10,180 @@ import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 from openpi.predictor.model import DiTPredictor
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.token_sensitivity import keep_top_sensitive_tokens, score_action_sensitive_tokens
 from typing import Generator 
 import sys
 import torch.nn.functional as F 
+
+
+def resolve_dynamic_token_keep_ratio(
+    action_left_sum: torch.Tensor | None,
+    *,
+    min_ratio: float = 0.5,
+    max_ratio: float = 1.0,
+    norm_scale: float = 4.0,
+    strategy: str = "action_norm",
+    fixed_ratio: float | None = None,
+    aeo_risk: float | None = None,
+    aeo_low_risk_threshold: float = 0.7,
+    aeo_high_risk_threshold: float = 0.9,
+    aeo_low_keep_ratio: float = 0.5,
+    aeo_mid_keep_ratio: float = 0.75,
+    aeo_high_keep_ratio: float = 1.0,
+) -> float:
+    """Map action context to an image-token keep ratio.
+
+    Supported strategies:
+      - ``action_norm``: keep more visual context for large unfinished action residuals.
+      - ``inverse_action_norm``: stress-test policy robustness by compressing high-motion steps harder.
+      - ``two_stage``: keep full tokens once urgency crosses a threshold, otherwise use the minimum.
+      - ``mid_band``: prioritize medium-urgency correction steps.
+      - ``aeo_dynamic``: keep 0.75/0.50 according to delta-norm risk.
+      - ``action_sensitive``: same keep-ratio schedule as ``aeo_dynamic``, but keeps sensitive tokens.
+      - ``aeo_risk``: alias for ``aeo_dynamic``.
+      - ``aeo_conservative``: keep 1.00/0.50 according to delta-norm risk.
+      - ``aeo_three_stage``: keep 1.00/0.75/0.50 according to delta-norm risk.
+      - ``fixed``: use a constant keep ratio for ablation.
+
+    ``action_left_sum=None`` means normal observation without queued-action context;
+    in that case dynamic schedules keep the full visual prefix.
+    """
+    if not 0.0 < min_ratio <= max_ratio <= 1.0:
+        raise ValueError(f"Expected 0 < min_ratio <= max_ratio <= 1, got {min_ratio=} {max_ratio=}")
+    if norm_scale <= 0.0:
+        raise ValueError(f"Expected norm_scale > 0, got {norm_scale=}")
+
+    if strategy == "fixed":
+        ratio = max_ratio if fixed_ratio is None else fixed_ratio
+        return float(min(max(ratio, min_ratio), max_ratio))
+
+    if strategy in {"aeo_dynamic", "action_sensitive", "aeo_risk", "aeo_conservative", "aeo_three_stage"}:
+        if action_left_sum is None or aeo_risk is None:
+            return max_ratio
+        risk = max(aeo_risk, 0.0)
+        if strategy in {"aeo_dynamic", "action_sensitive", "aeo_risk"}:
+            ratio = aeo_mid_keep_ratio if risk > 0.85 else aeo_low_keep_ratio
+        elif strategy == "aeo_conservative":
+            ratio = aeo_high_keep_ratio if risk > aeo_low_risk_threshold else aeo_low_keep_ratio
+        else:
+            if risk > aeo_high_risk_threshold:
+                ratio = aeo_high_keep_ratio
+            elif risk > aeo_low_risk_threshold:
+                ratio = aeo_mid_keep_ratio
+            else:
+                ratio = aeo_low_keep_ratio
+        return float(min(max(ratio, min_ratio), max_ratio))
+
+    if action_left_sum is None:
+        return max_ratio
+
+    action_tensor = torch.as_tensor(action_left_sum, dtype=torch.float32)
+    action_norm = torch.linalg.vector_norm(action_tensor.flatten(), ord=2).item()
+    urgency = min(action_norm / norm_scale, 1.0)
+
+    if strategy == "action_norm":
+        schedule_value = urgency
+    elif strategy == "inverse_action_norm":
+        schedule_value = 1.0 - urgency
+    elif strategy == "two_stage":
+        schedule_value = 1.0 if urgency >= 0.65 else 0.0
+    elif strategy == "mid_band":
+        schedule_value = 1.0 - abs(urgency - 0.5) * 2.0
+    else:
+        raise ValueError(f"Unknown dynamic token compression strategy: {strategy}")
+
+    return min_ratio + (max_ratio - min_ratio) * schedule_value
+
+
+def compress_tokens_by_saliency(
+    token_embs: torch.Tensor,
+    token_masks: torch.Tensor,
+    keep_ratio: float,
+    *,
+    saliency: str = "l2",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Keep selected valid tokens from a batched token sequence.
+
+    Selection modes:
+      - ``l2``: top embedding L2 norm tokens.
+      - ``abs_mean``: top mean absolute activation tokens.
+      - ``uniform_stride``: deterministic evenly-spaced tokens for fixed-rate baselines.
+
+    The function keeps a fixed number of tokens for the whole batch so downstream
+    transformer calls remain rectangular.
+    """
+    if token_embs.ndim != 3:
+        raise ValueError(f"token_embs must have shape [B, N, D], got {tuple(token_embs.shape)}")
+    if token_masks.ndim != 2:
+        raise ValueError(f"token_masks must have shape [B, N], got {tuple(token_masks.shape)}")
+    if token_embs.shape[:2] != token_masks.shape:
+        raise ValueError(f"token_embs and token_masks disagree: {tuple(token_embs.shape[:2])} vs {tuple(token_masks.shape)}")
+    if not 0.0 < keep_ratio <= 1.0:
+        raise ValueError(f"keep_ratio must be in (0, 1], got {keep_ratio}")
+
+    batch_size, num_tokens, hidden_dim = token_embs.shape
+    keep_count = max(1, math.ceil(num_tokens * keep_ratio))
+    if keep_count >= num_tokens:
+        indices = torch.arange(num_tokens, device=token_embs.device).expand(batch_size, num_tokens)
+        return token_embs, token_masks, indices
+
+    if saliency == "uniform_stride":
+        base_indices = torch.linspace(0, num_tokens - 1, steps=keep_count, device=token_embs.device).round().long()
+        indices = base_indices.expand(batch_size, keep_count)
+    elif saliency == "l2":
+        scores = torch.linalg.vector_norm(token_embs.float(), ord=2, dim=-1)
+        scores = scores.masked_fill(~token_masks.bool(), torch.finfo(scores.dtype).min)
+        indices = torch.topk(scores, k=keep_count, dim=1, largest=True, sorted=False).indices
+        indices = torch.sort(indices, dim=1).values
+    elif saliency == "abs_mean":
+        scores = token_embs.float().abs().mean(dim=-1)
+        scores = scores.masked_fill(~token_masks.bool(), torch.finfo(scores.dtype).min)
+        indices = torch.topk(scores, k=keep_count, dim=1, largest=True, sorted=False).indices
+        indices = torch.sort(indices, dim=1).values
+    else:
+        raise ValueError(f"Unknown token saliency mode: {saliency}")
+
+    gather_indices = indices.unsqueeze(-1).expand(batch_size, keep_count, hidden_dim)
+    compressed_embs = torch.gather(token_embs, dim=1, index=gather_indices)
+    compressed_masks = torch.gather(token_masks.bool(), dim=1, index=indices)
+    return compressed_embs, compressed_masks, indices
+
+
+def compress_tokens_by_1d_pooling(
+    token_embs: torch.Tensor,
+    token_masks: torch.Tensor,
+    keep_ratio: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compress visual tokens with deterministic 1D average pooling.
+
+    This treats the visual prefix as a single ordered token sequence
+    ``[B, N, D] -> [B, K, D]`` and intentionally does not apply 2D grid pooling.
+    """
+    if token_embs.ndim != 3:
+        raise ValueError(f"token_embs must have shape [B, N, D], got {tuple(token_embs.shape)}")
+    if token_masks.ndim != 2:
+        raise ValueError(f"token_masks must have shape [B, N], got {tuple(token_masks.shape)}")
+    if token_embs.shape[:2] != token_masks.shape:
+        raise ValueError(f"token_embs and token_masks disagree: {tuple(token_embs.shape[:2])} vs {tuple(token_masks.shape)}")
+    if not 0.0 < keep_ratio <= 1.0:
+        raise ValueError(f"keep_ratio must be in (0, 1], got {keep_ratio}")
+
+    batch_size, num_tokens, _ = token_embs.shape
+    keep_count = max(1, math.ceil(num_tokens * keep_ratio))
+    if keep_count >= num_tokens:
+        return token_embs, token_masks
+
+    pooled_embs = F.adaptive_avg_pool1d(token_embs.transpose(1, 2), keep_count).transpose(1, 2)
+    pooled_masks = F.adaptive_max_pool1d(token_masks.float().unsqueeze(1), keep_count).squeeze(1).bool()
+    if pooled_masks.shape[0] != batch_size:
+        raise ValueError(f"pooled mask batch mismatch: expected {batch_size}, got {pooled_masks.shape[0]}")
+    return pooled_embs, pooled_masks
+
+
+def estimate_visual_token_payload_mb(num_tokens: int, hidden_dim: int, *, bytes_per_value: int = 4) -> float:
+    """Return a token-level payload proxy in MiB for visual embeddings."""
+    return num_tokens * hidden_dim * bytes_per_value / (1024 * 1024)
+
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
@@ -86,6 +258,25 @@ class SVLAPytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.dynamic_token_compression = bool(getattr(config, "dynamic_token_compression", False))
+        self.dynamic_token_min_keep_ratio = float(getattr(config, "dynamic_token_min_keep_ratio", 0.5))
+        self.dynamic_token_max_keep_ratio = float(getattr(config, "dynamic_token_max_keep_ratio", 1.0))
+        self.dynamic_token_norm_scale = float(getattr(config, "dynamic_token_norm_scale", 4.0))
+        self.dynamic_token_strategy = str(getattr(config, "dynamic_token_strategy", "action_norm"))
+        self.vision_compression_strategy = getattr(config, "vision_compression_strategy", None)
+        if self.vision_compression_strategy is None:
+            self.vision_compression_strategy = self.dynamic_token_strategy
+        self.vision_compression_strategy = str(self.vision_compression_strategy)
+        self.dynamic_token_fixed_keep_ratio = getattr(config, "dynamic_token_fixed_keep_ratio", None)
+        self.dynamic_token_saliency = str(getattr(config, "dynamic_token_saliency", "l2"))
+        self.dynamic_token_aeo_low_risk_threshold = float(getattr(config, "dynamic_token_aeo_low_risk_threshold", 0.7))
+        self.dynamic_token_aeo_high_risk_threshold = float(getattr(config, "dynamic_token_aeo_high_risk_threshold", 0.9))
+        self.dynamic_token_aeo_low_keep_ratio = float(getattr(config, "dynamic_token_aeo_low_keep_ratio", 0.5))
+        self.dynamic_token_aeo_mid_keep_ratio = float(getattr(config, "dynamic_token_aeo_mid_keep_ratio", 0.75))
+        self.dynamic_token_aeo_high_keep_ratio = float(getattr(config, "dynamic_token_aeo_high_keep_ratio", 1.0))
+        self.vision_token_sensitivity_norm_weight = float(getattr(config, "vision_token_sensitivity_norm_weight", 0.25))
+        self.vision_token_sensitivity_delta_weight = float(getattr(config, "vision_token_sensitivity_delta_weight", 0.65))
+        self.vision_token_sensitivity_action_weight = float(getattr(config, "vision_token_sensitivity_action_weight", 0.10))
 
         # Initialize the AEO predictor and load weights
         aeo = DiTPredictor(
@@ -100,8 +291,16 @@ class SVLAPytorch(nn.Module):
         
         object.__setattr__(self, 'aeo_predictor', aeo)
         
-        # Load the checkpoint for the AEO predictor补上 AEO predictor 路径
-        checkpoint_path = "/home/ubuntu/StreamingVLA/checkpoints/StreamingVLA_LIBERO_Predictor/svla_predictor.pth"  # e.g., "gs://openpi-assets/checkpoints/aeo_predictor/your_checkpoint.pth"
+        # Load the checkpoint for the AEO predictor.  Prefer an explicit model config,
+        # then the A100/runtime environment variable, then the repository-local default.
+        checkpoint_path = (
+            getattr(config, "aeo_predictor_path", None)
+            or os.environ.get("SVLA_AEO_PREDICTOR_PATH")
+            or os.environ.get("AEO_PREDICTOR_PATH")
+            or "/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO_Predictor/svla_predictor.pth"
+        )
+        if os.path.isdir(checkpoint_path):
+            checkpoint_path = os.path.join(checkpoint_path, "svla_predictor.pth")
         
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         real_state_dict = checkpoint.get("model_state_dict", checkpoint)
@@ -221,6 +420,7 @@ class SVLAPytorch(nn.Module):
             img_emb = self._apply_checkpoint(image_embed_func, img)
             bsize, num_img_embs = img_emb.shape[:2]
 
+            delta_embedding = None
             if not train:
                 if action_left_sum is not None and count==1:
                     
@@ -244,8 +444,58 @@ class SVLAPytorch(nn.Module):
                 else:
                     print("No action_left_sum provided, skipping AEO predictor adjustment.")        
             
+            img_pad_mask = img_mask[:, None].expand(bsize, num_img_embs)
+            if self.dynamic_token_compression and not train:
+                original_num_img_embs = num_img_embs
+                threshold_value = getattr(self, "_current_aeo_threshold", None)
+                aeo_risk = None
+                if action_left_sum is not None and threshold_value is not None and threshold_value > 0:
+                    aeo_risk = delta_embedding_norm / threshold_value
+                keep_ratio = resolve_dynamic_token_keep_ratio(
+                    action_left_sum,
+                    min_ratio=self.dynamic_token_min_keep_ratio,
+                    max_ratio=self.dynamic_token_max_keep_ratio,
+                    norm_scale=self.dynamic_token_norm_scale,
+                    strategy=self.vision_compression_strategy,
+                    fixed_ratio=self.dynamic_token_fixed_keep_ratio,
+                    aeo_risk=aeo_risk,
+                    aeo_low_risk_threshold=self.dynamic_token_aeo_low_risk_threshold,
+                    aeo_high_risk_threshold=self.dynamic_token_aeo_high_risk_threshold,
+                    aeo_low_keep_ratio=self.dynamic_token_aeo_low_keep_ratio,
+                    aeo_mid_keep_ratio=self.dynamic_token_aeo_mid_keep_ratio,
+                    aeo_high_keep_ratio=self.dynamic_token_aeo_high_keep_ratio,
+                )
+                original_payload_mb = estimate_visual_token_payload_mb(original_num_img_embs, img_emb.shape[-1])
+                if self.vision_compression_strategy == "action_sensitive":
+                    sensitivity_scores = score_action_sensitive_tokens(
+                        img_emb,
+                        img_pad_mask,
+                        action_context=action_left_sum,
+                        delta_embs=delta_embedding,
+                        norm_weight=self.vision_token_sensitivity_norm_weight,
+                        delta_weight=self.vision_token_sensitivity_delta_weight,
+                        action_weight=self.vision_token_sensitivity_action_weight,
+                    )
+                    img_emb, img_pad_mask, _ = keep_top_sensitive_tokens(
+                        img_emb, img_pad_mask, keep_ratio, sensitivity_scores
+                    )
+                    compression_operator = "action_sensitive_topk"
+                else:
+                    img_emb, img_pad_mask = compress_tokens_by_1d_pooling(img_emb, img_pad_mask, keep_ratio)
+                    compression_operator = "avg_pool_1d"
+                num_img_embs = img_emb.shape[1]
+                compressed_payload_mb = estimate_visual_token_payload_mb(num_img_embs, img_emb.shape[-1])
+                risk_text = "none" if aeo_risk is None else f"{aeo_risk:.4f}"
+                print(
+                    "[TokenCompression] "
+                    f"vision_compression_strategy={self.vision_compression_strategy} pooling={compression_operator} "
+                    f"risk={risk_text} keep_ratio={keep_ratio:.4f} "
+                    f"tokens {original_num_img_embs} -> {num_img_embs} "
+                    f"payload {original_payload_mb:.4f} MB -> {compressed_payload_mb:.4f} MB"
+                )
+
             embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+            pad_masks.append(img_pad_mask)
             att_masks += [0] * num_img_embs
 
         # Process language tokens
@@ -423,9 +673,11 @@ class SVLAPytorch(nn.Module):
         threshold = observation.threshold
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
-        
+
+        self._current_aeo_threshold = threshold
         prefix_embs, prefix_pad_masks, prefix_att_masks, delta_embedding_norm = self.embed_prefix(images, img_masks, lang_tokens, lang_masks, action_left_sum)
-        
+        self._current_aeo_threshold = None
+
         if (threshold==100000.0):
             print("[Sample actions]: Norm observation")
 
