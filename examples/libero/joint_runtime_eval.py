@@ -36,6 +36,10 @@ class Args:
     replan_steps: int = 10
     max_actions_per_inference: int = 10
     action_timeout: float = 20.0
+    clear_action_queue_on_replan: bool = False
+    max_timeouts_per_episode: int = 1
+    strict_request_id_matching: bool = False
+    enable_runtime_protocol: bool = False
     clear_action_queue_on_replan: bool = True
     max_timeouts_per_episode: int = 1
 
