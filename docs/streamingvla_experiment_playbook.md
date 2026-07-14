@@ -203,9 +203,11 @@ layers × 2(K,V) × prefix_tokens × kv_heads × head_dim × bytes
 ### 7.1 基础环境
 
 ```bash
-cd /workspace/streamingvla_my
+cd /home/ubuntu/streamingvla_my
 export CUDA_VISIBLE_DEVICES=0
-export CKPT=/path/to/your/checkpoint
+export CKPT=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO/58300
+export AEO_PREDICTOR=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO_Predictor
+export SVLA_AEO_PREDICTOR_PATH=$AEO_PREDICTOR/svla_predictor.pth
 export PORT=8000
 
 mkdir -p outputs/token_compression/timing
@@ -283,7 +285,266 @@ python scripts/summarize_token_compression_results.py \
   --format markdown | tee outputs/token_compression/summary.md
 ```
 
-## 8. 推荐实验顺序
+## 8. A100 上逐步执行的完整命令
+
+下面命令假设：
+
+- 仓库路径：`/home/ubuntu/streamingvla_my`；
+- StreamingVLA 权重：`/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO/58300`；
+- AEO predictor：`/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO_Predictor/svla_predictor.pth`；
+- 单卡 A100：`CUDA_VISIBLE_DEVICES=0`；
+- policy server 端口：`8000`。
+
+### 8.1 先跑不加载 checkpoint 的规划脚本
+
+```bash
+cd /home/ubuntu/streamingvla_my
+export CUDA_VISIBLE_DEVICES=0
+export CKPT=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO/58300
+export AEO_PREDICTOR=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO_Predictor
+export SVLA_AEO_PREDICTOR_PATH=$AEO_PREDICTOR/svla_predictor.pth
+export PORT=8000
+
+mkdir -p outputs/token_compression/timing \
+         outputs/token_compression/videos \
+         outputs/token_compression/logs
+
+python scripts/experiment_dynamic_token_compression.py --samples 1024 --pretty | \
+  tee outputs/token_compression/dynamic_proxy.txt
+
+python scripts/experiment_kv_token_transport.py \
+  --keep-ratios 0.75,0.5,0.4,0.25 \
+  --token-bytes-per-value 1 \
+  --kv-bytes-per-value 1 \
+  --downlink-mbps 1000 \
+  --format markdown | tee outputs/token_compression/transport_proxy.md
+```
+
+### 8.2 Smoke test：baseline / fixed050 / action-sensitive
+
+每次只启动一个 server。启动 server 后，在第二个终端跑 evaluator；当前实验结束后，停止 server，再启动下一组 config。
+
+Baseline server：
+
+```bash
+cd /home/ubuntu/streamingvla_my
+export CUDA_VISIBLE_DEVICES=0
+export CKPT=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO/58300
+export AEO_PREDICTOR=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO_Predictor
+export SVLA_AEO_PREDICTOR_PATH=$AEO_PREDICTOR/svla_predictor.pth
+export PORT=8000
+
+CUDA_VISIBLE_DEVICES=0 uv run scripts/serve_policy.py policy:checkpoint \
+  --policy.config=streamingvla_pi05_libero \
+  --policy.dir=$CKPT \
+  --port=$PORT 2>&1 | tee outputs/token_compression/logs/server_smoke_baseline.log
+```
+
+Baseline evaluator：
+
+```bash
+cd /home/ubuntu/streamingvla_my
+source examples/libero/.venv/bin/activate
+export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero
+export MUJOCO_GL=glx
+export PORT=8000
+
+python examples/libero/streamingvla.py \
+  --host 0.0.0.0 \
+  --port $PORT \
+  --task-suite-name libero_object \
+  --num-trials-per-task 2 \
+  --timing-output-path outputs/token_compression/timing/smoke_baseline.txt \
+  --video-out-path outputs/token_compression/videos/smoke_baseline \
+  2>&1 | tee outputs/token_compression/logs/eval_smoke_baseline.log
+```
+
+Fixed 0.50 server：
+
+```bash
+cd /home/ubuntu/streamingvla_my
+export CUDA_VISIBLE_DEVICES=0
+export CKPT=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO/58300
+export AEO_PREDICTOR=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO_Predictor
+export SVLA_AEO_PREDICTOR_PATH=$AEO_PREDICTOR/svla_predictor.pth
+export PORT=8000
+
+CUDA_VISIBLE_DEVICES=0 uv run scripts/serve_policy.py policy:checkpoint \
+  --policy.config=streamingvla_pi05_libero_token_fixed050 \
+  --policy.dir=$CKPT \
+  --port=$PORT 2>&1 | tee outputs/token_compression/logs/server_smoke_fixed050.log
+```
+
+Fixed 0.50 evaluator：
+
+```bash
+cd /home/ubuntu/streamingvla_my
+source examples/libero/.venv/bin/activate
+export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero
+export MUJOCO_GL=glx
+export PORT=8000
+
+python examples/libero/streamingvla.py \
+  --host 0.0.0.0 \
+  --port $PORT \
+  --task-suite-name libero_object \
+  --num-trials-per-task 2 \
+  --timing-output-path outputs/token_compression/timing/smoke_fixed050.txt \
+  --video-out-path outputs/token_compression/videos/smoke_fixed050 \
+  2>&1 | tee outputs/token_compression/logs/eval_smoke_fixed050.log
+```
+
+Action-sensitive server：
+
+```bash
+cd /home/ubuntu/streamingvla_my
+export CUDA_VISIBLE_DEVICES=0
+export CKPT=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO/58300
+export AEO_PREDICTOR=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO_Predictor
+export SVLA_AEO_PREDICTOR_PATH=$AEO_PREDICTOR/svla_predictor.pth
+export PORT=8000
+
+CUDA_VISIBLE_DEVICES=0 uv run scripts/serve_policy.py policy:checkpoint \
+  --policy.config=streamingvla_pi05_libero_token_action_sensitive \
+  --policy.dir=$CKPT \
+  --port=$PORT 2>&1 | tee outputs/token_compression/logs/server_smoke_action_sensitive.log
+```
+
+Action-sensitive evaluator：
+
+```bash
+cd /home/ubuntu/streamingvla_my
+source examples/libero/.venv/bin/activate
+export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero
+export MUJOCO_GL=glx
+export PORT=8000
+
+python examples/libero/streamingvla.py \
+  --host 0.0.0.0 \
+  --port $PORT \
+  --task-suite-name libero_object \
+  --num-trials-per-task 2 \
+  --timing-output-path outputs/token_compression/timing/smoke_action_sensitive.txt \
+  --video-out-path outputs/token_compression/videos/smoke_action_sensitive \
+  2>&1 | tee outputs/token_compression/logs/eval_smoke_action_sensitive.log
+```
+
+### 8.3 主实验：libero_object，10 次 / 30 次 trials
+
+把下面的 `N=10` 先跑完；如果没有 server/evaluator 错误，再改成 `N=30` 重跑主结果。每个 config 仍然需要单独启动对应 server。
+
+```bash
+cd /home/ubuntu/streamingvla_my
+export CUDA_VISIBLE_DEVICES=0
+export CKPT=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO/58300
+export AEO_PREDICTOR=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO_Predictor
+export SVLA_AEO_PREDICTOR_PATH=$AEO_PREDICTOR/svla_predictor.pth
+export PORT=8000
+export SUITE=libero_object
+export N=10
+```
+
+对每个 config 启动 server，例如 baseline：
+
+```bash
+export CONFIG=streamingvla_pi05_libero
+export RUN=object_${N}_baseline
+CUDA_VISIBLE_DEVICES=0 uv run scripts/serve_policy.py policy:checkpoint \
+  --policy.config=$CONFIG \
+  --policy.dir=$CKPT \
+  --port=$PORT 2>&1 | tee outputs/token_compression/logs/server_${RUN}.log
+```
+
+第二个终端跑对应 evaluator：
+
+```bash
+cd /home/ubuntu/streamingvla_my
+source examples/libero/.venv/bin/activate
+export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero
+export MUJOCO_GL=glx
+export PORT=8000
+export SUITE=libero_object
+export N=10
+export RUN=object_${N}_baseline
+
+python examples/libero/streamingvla.py \
+  --host 0.0.0.0 \
+  --port $PORT \
+  --task-suite-name $SUITE \
+  --num-trials-per-task $N \
+  --timing-output-path outputs/token_compression/timing/${RUN}.txt \
+  --video-out-path outputs/token_compression/videos/${RUN} \
+  2>&1 | tee outputs/token_compression/logs/eval_${RUN}.log
+```
+
+主实验需要依次替换为以下 config / run name：
+
+```bash
+# baseline
+CONFIG=streamingvla_pi05_libero
+RUN=object_${N}_baseline
+
+# fixed 0.75
+CONFIG=streamingvla_pi05_libero_token_fixed075
+RUN=object_${N}_fixed075
+
+# fixed 0.50
+CONFIG=streamingvla_pi05_libero_token_fixed050
+RUN=object_${N}_fixed050
+
+# AEO-aware three-stage
+CONFIG=streamingvla_pi05_libero_token_aeo_three_stage
+RUN=object_${N}_aeo_three_stage
+
+# action-sensitive
+CONFIG=streamingvla_pi05_libero_token_action_sensitive
+RUN=object_${N}_action_sensitive
+```
+
+### 8.4 长程任务诊断：libero_10
+
+长程任务先只跑 baseline、AEO three-stage、action-sensitive。
+
+```bash
+cd /home/ubuntu/streamingvla_my
+export CUDA_VISIBLE_DEVICES=0
+export CKPT=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO/58300
+export AEO_PREDICTOR=/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO_Predictor
+export SVLA_AEO_PREDICTOR_PATH=$AEO_PREDICTOR/svla_predictor.pth
+export PORT=8000
+export SUITE=libero_10
+export N=10
+```
+
+长程诊断 config / run name：
+
+```bash
+CONFIG=streamingvla_pi05_libero
+RUN=libero10_${N}_baseline
+
+CONFIG=streamingvla_pi05_libero_token_aeo_three_stage
+RUN=libero10_${N}_aeo_three_stage
+
+CONFIG=streamingvla_pi05_libero_token_action_sensitive
+RUN=libero10_${N}_action_sensitive
+```
+
+server / evaluator 命令与 8.3 相同，只需要替换 `$SUITE`、`$N`、`$CONFIG`、`$RUN`。
+
+### 8.5 汇总所有结果
+
+```bash
+cd /home/ubuntu/streamingvla_my
+python scripts/summarize_token_compression_results.py \
+  outputs/token_compression/timing \
+  --format markdown | tee outputs/token_compression/summary.md
+
+python scripts/summarize_token_compression_results.py \
+  outputs/token_compression/timing \
+  --format csv | tee outputs/token_compression/summary.csv
+```
+
+## 9. 推荐实验顺序
 
 ### Stage A：smoke test
 

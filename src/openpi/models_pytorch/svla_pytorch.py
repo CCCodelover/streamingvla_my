@@ -305,8 +305,16 @@ class SVLAPytorch(nn.Module):
         
         object.__setattr__(self, 'aeo_predictor', aeo)
         
-        # Load the checkpoint for the AEO predictor补上 AEO predictor 路径
-        checkpoint_path = "/home/ubuntu/StreamingVLA/checkpoints/StreamingVLA_LIBERO_Predictor/svla_predictor.pth"  # e.g., "gs://openpi-assets/checkpoints/aeo_predictor/your_checkpoint.pth"
+        # Load the checkpoint for the AEO predictor.  Prefer an explicit model config,
+        # then the A100/runtime environment variable, then the repository-local default.
+        checkpoint_path = (
+            getattr(config, "aeo_predictor_path", None)
+            or os.environ.get("SVLA_AEO_PREDICTOR_PATH")
+            or os.environ.get("AEO_PREDICTOR_PATH")
+            or "/home/ubuntu/streamingvla_my/checkpoints/StreamingVLA_LIBERO_Predictor/svla_predictor.pth"
+        )
+        if os.path.isdir(checkpoint_path):
+            checkpoint_path = os.path.join(checkpoint_path, "svla_predictor.pth")
         
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         real_state_dict = checkpoint.get("model_state_dict", checkpoint)
