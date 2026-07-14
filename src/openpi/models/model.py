@@ -95,7 +95,10 @@ class Observation(Generic[ArrayT]):
     state: at.Float[ArrayT, "*b s"]
 
     action_states:at.Float[ArrayT, "*b ad"] | None = None
-    action_left_sum: at.Float[ArrayT, "*b ad"] | None = None
+    # ``action_left_sum`` is the 6-DoF residual used by the AEO/judger path,
+    # while ``action_states`` follows the 7-D LIBERO action convention. Keep the
+    # jaxtyping axis name distinct so the two fields are not forced to share size.
+    action_left_sum: at.Float[ArrayT, "*b ac"] | None = None
     threshold: at.Float[ArrayT, "*b"] | None = None
     vision_keep_ratio: at.Float[ArrayT, "*b"] | None = None
     runtime_token_keep_ratio: at.Float[ArrayT, "*b"] | None = None
